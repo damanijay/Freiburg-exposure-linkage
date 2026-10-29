@@ -1,0 +1,13 @@
+"scheme","season","method","RMSE","MAE","bias"
+"random_pixels","cold (Oct-Mar)","clim_anomaly",1.82,1.32,0.01
+"random_pixels","cold (Oct-Mar)","climatology",4.35,3.35,0.01
+"random_pixels","cold (Oct-Mar)","linear",4.51,3.2,0.1
+"random_pixels","warm (Apr-Sep)","clim_anomaly",1.38,1.04,0.01
+"random_pixels","warm (Apr-Sep)","linear",3.05,2.34,-0.01
+"random_pixels","warm (Apr-Sep)","climatology",3.32,2.69,0.05
+"whole_weeks","cold (Oct-Mar)","clim_anomaly",3.73,2.79,-0.38
+"whole_weeks","cold (Oct-Mar)","climatology",3.85,2.91,-0.04
+"whole_weeks","cold (Oct-Mar)","linear",4.26,2.87,0.01
+"whole_weeks","warm (Apr-Sep)","linear",2.83,2.26,-0.22
+"whole_weeks","warm (Apr-Sep)","clim_anomaly",2.89,2.31,-0.24
+"whole_weeks","warm (Apr-Sep)","climatology",3.27,2.67,-0.56

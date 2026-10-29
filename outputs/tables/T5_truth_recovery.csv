@@ -1,0 +1,2 @@
+"estimate","truth","SE_naive","SE_clust","CI_naive","CI_clust","truth_in_naive_CI","truth_in_clust_CI"
+-0.363,-0.447,0.042,0.037,"-0.445 to -0.281","-0.436 to -0.29",FALSE,FALSE

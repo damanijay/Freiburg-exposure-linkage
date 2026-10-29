@@ -1,0 +1,3 @@
+"model","green_per_10pp","elev_per_100m","R2"
+"1: green only",-0.74,NA,0.52
+"2: green + elevation",-0.4,-0.71,0.77

@@ -1,0 +1,515 @@
+---
+title: "Linking satellite environmental exposures to a child cohort"
+subtitle: "A reproducible exposure database for Freiburg im Breisgau, 2021–2024"
+author: "Jay Damani"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    theme: flatly
+    code_folding: hide
+    self_contained: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE,
+                      fig.align = "center", out.width = "92%")
+library(DBI); library(duckdb); library(dplyr); library(knitr); library(kableExtra)
+
+con <- dbConnect(duckdb(), dbdir = "db/freiburg_exposure.duckdb", read_only = TRUE)
+qry <- function(sql) dbGetQuery(con, sql)
+
+# Include a figure only if it was produced
+fig <- function(f, cap) {
+  p <- file.path("outputs/figures", f)
+  if (file.exists(p)) knitr::include_graphics(p) else invisible(NULL)
+}
+# Read a results table if it exists
+tab <- function(f) {
+  p <- file.path("outputs/tables", f)
+  if (file.exists(p)) read.csv(p) else NULL
+}
+show <- function(d, cap, dig = 2) {
+  if (is.null(d)) return(invisible(NULL))
+  kable(d, caption = cap, digits = dig, row.names = FALSE) |>
+    kable_styling(bootstrap_options = c("striped", "condensed"), full_width = FALSE)
+}
+```
+
+# Summary
+
+This report documents a working exposure-linkage pipeline for Freiburg im Breisgau. Satellite land surface
+temperature, satellite vegetation, classified land cover and terrain are processed into a hexagonal grid,
+quality-screened, gap-filled with a validated method, and linked to a simulated cohort of 500 children over
+exposure windows of 7, 30 and 365 days before each child's examination date. The output is a single DuckDB
+database with full provenance on every value, 19 automated integrity tests, and a demonstrated incremental
+update procedure.
+
+The cohort is simulated; **all environmental data are real**.
+
+```{r headline}
+h <- qry("SELECT COUNT(*) AS hexagon_weeks FROM lst_weekly")
+s <- qry("SELECT source, COUNT(*) AS n FROM lst_weekly GROUP BY source ORDER BY source")
+data.frame(
+  Finding = c("Satellite gaps are seasonal and spatially clustered",
+              "Ignoring gaps biases annual exposure",
+              "Gap-filling method selected on pre-specified rule",
+              "Satellite tracks ground-measured weather",
+              "Elevation confounds the green–heat relationship",
+              "Exposure window determines what is measured",
+              "Lower socioeconomic position, hotter and less green"),
+  Result = c("14.4% of hexagon-weeks missing; 46% in October, 0.9% in August; 26.5% missing in populated hexagons vs 22.9% elsewhere",
+             "Annual exposure overestimated by 1.43 °C on average, in the same direction for nearly every child",
+             "Climatology-plus-anomaly, cold-season RMSE 1.66 °C on withheld pixels",
+             "Deseasonalised correlation with DWD station Freiburg r = 0.82",
+             "Apparent cooling per 10 pp green falls 45% after adjustment (−0.74 to −0.40 °C)",
+             "Exam month explains 92% of 7-day exposure; location explains 63% of 365-day exposure",
+             "−0.22 °C annual LST and +3.6 pp green per 1 SD higher SES")
+) |> show("Headline results", 3)
+```
+
+# Background and objective
+
+Environmental epidemiology in child cohorts needs exposure values attached to individual participants at
+individual dates. The practical obstacle is rarely the statistical model; it is that satellite records are
+incomplete, that the incompleteness is not random, and that exposure must be defined over a window that
+matches the hypothesised mechanism.
+
+The objective here was to build the full chain end to end for one city, document every decision, and show
+that the result can be maintained when new data arrive. Freiburg was chosen because it spans 195 m on the
+Rhine valley floor to 1,283 m in the Black Forest within a single municipality, which makes terrain
+confounding visible rather than hypothetical.
+
+## Data sources
+
+```{r sources}
+data.frame(
+  Source = c("MODIS MOD11A2 v061", "Sentinel-2 L2A", "ESA WorldCover 2021",
+             "OpenStreetMap", "Copernicus DEM GLO-30", "DWD station 01443",
+             "OSM administrative boundary"),
+  Variable = c("Land surface temperature, 8-day composite, 1 km",
+               "NDVI, summer median, 10 m",
+               "Land cover, 10 m",
+               "Parks, forest, water features",
+               "Elevation, 30 m",
+               "Daily air temperature (Tmax, Tmean)",
+               "Municipal boundary"),
+  Use = c("Heat exposure 2021–2024", "Vegetation greenness",
+          "Green, built-up, cropland, water shares",
+          "Independent green comparison; park access",
+          "Terrain confounder", "External validation",
+          "Study area definition")
+) |> show("Input data", 0)
+```
+
+## Analytical grid
+
+The city (152.9 km²) was tiled with 204 hexagons of 1 km². Hexagons are preferred to squares because every
+neighbour shares an edge at equal centroid distance, which avoids the diagonal-neighbour ambiguity of a
+square lattice. Edge hexagons are retained with an `inside_frac` weight; land-cover shares are computed over
+the within-city portion only. Applying this weighting changed the citywide built-up share from 13.8% to 16.4%
+— the unweighted figure had diluted dense edge hexagons with area outside the municipality.
+
+# Methods
+
+## Quality screening of satellite temperature
+
+MODIS pixels were accepted only where the QC bitfield indicated good quality or an LST error below 2 K
+(mandatory QA 0, or 1 with error flag ≤ 1). Pixels failing this were set to missing rather than retained with
+a warning flag, on the basis that a flagged value propagates silently into a weekly mean.
+
+A hexagon-week was treated as observed only if **at least 50% of the hexagon area** had valid pixels. Without
+this rule, a hexagon mean could be computed from a single clear corner and would not represent the hexagon.
+The threshold was fixed before results were examined.
+
+## Gap diagnosis
+
+```{r gap-table}
+show(data.frame(
+  Window = c("7 days", "30 days", "365 days"),
+  `No data at all` = c("50 children (10.0%)", "3 children (0.6%)", "0"),
+  `Coverage below 50%` = c("19.6%", "15.0%", "0%"),
+  `Worst quarter` = c("Q4: 34.9%", "Q4: 37.2%", "—"),
+  check.names = FALSE),
+  "Exposure-window completeness before gap-filling", 1)
+```
+
+```{r f5}
+fig("F5_gaps_by_month.png", "Missing hexagon-weeks by month")
+```
+
+```{r f6}
+fig("F6_gaps_cold_map.png", "Cold-season data loss by hexagon")
+```
+
+Gaps concentrate between October and February and fall more heavily on the dense city core than on the
+forested uplands. Hexagons containing cohort children lost 26.5% of cold-season weeks against 22.9% for
+hexagons without children. Two mechanisms are plausible and cannot be separated with these data: radiation
+fog pooling on the valley floor, and more frequent QC rejection of mixed urban pixels. Either way the
+missingness is informative with respect to the study population, which is the reason gap-filling was
+validated rather than assumed.
+
+## Gap-filling: candidate methods and selection
+
+Three methods were compared:
+
+1. **Climatology** — the hexagon's own mean for that 8-day slot (±1 slot) across all years.
+2. **Linear temporal interpolation** — straight line between the nearest observed weeks for that hexagon.
+3. **Climatology plus anomaly** — the hexagon's climatology adjusted by the citywide median anomaly for that
+   week, taken from hexagons that *were* observed; where a whole week is missing, the anomaly is interpolated
+   in time.
+
+Validation withheld 10% of **known** values and compared each method's reconstruction against the truth,
+under two withholding schemes: random pixels (scattered cloud) and whole weeks (missing composites). Twenty
+replicates per scheme. Critically, climatology was recomputed from the withheld matrix in every replicate, so
+no method had sight of the values it was asked to predict.
+
+**Selection rule, fixed in advance:** lowest cold-season RMSE averaged across both schemes. The cold season
+is where the real gaps are.
+
+```{r t1}
+show(tab("T1_interpolation_validation_v1.1.csv"), "Gap-filling validation (°C), method v1.1")
+```
+
+```{r f7}
+fig("F7_interpolation_rmse.png", "Reconstruction error on withheld observations")
+```
+
+Climatology-plus-anomaly was selected (cold-season mean RMSE 2.79 °C against 3.99 for climatology and 4.22
+for linear). Its advantage is large where part of the week was observed — 1.66 °C against 4.27 and 4.47 for
+random withheld pixels — because the citywide anomaly carries that week's actual weather. Where an entire
+composite is missing, no anomaly can be borrowed and all three methods converge near 3.7–4.0 °C. That is the
+honest ceiling of temporal interpolation without an external meteorological source.
+
+## Outlier screening (protocol v1.1)
+
+External station comparison revealed values that internal cross-validation could not detect, including an
+LST of −10.0 °C in the station hexagon on 1 November 2023 against an air maximum of 13.8 °C — a cloud top
+recorded as ground. The protocol was therefore amended before the database was built.
+
+Each value was expressed as a deviation from its own hexagon's seasonal climatology, then compared with the
+citywide median deviation for that week. Values exceeding **4 robust standard deviations** (MAD-based,
+σ = 0.93 °C) were flagged, set to missing, refilled, and retained in the provenance field as
+`removed_outlier`. Flagged values total 329, or **1.37% of observations** — concentrated in partly cloudy
+weeks (33 hexagons on 9 May 2021; 28 on 27 December 2022), consistent with unmasked cloud edges.
+
+The anomaly estimator was simultaneously made robust: median rather than mean across hexagons, and trusted
+only when ≥20% of hexagons were observed that week. This removed the large reconstruction errors previously
+seen in sparse weeks such as 2 February 2021 (62 of 650 pixels valid).
+
+```{r t1b}
+o <- tab("T1b_outliers_removed.csv")
+if (!is.null(o)) {
+  o |> count(date, name = "hexagons_flagged") |> arrange(desc(hexagons_flagged)) |> head(8) |>
+    show("Dates with most flagged values", 0)
+}
+```
+
+## Exposure windows
+
+Each composite contributes to a child's window in proportion to the number of days it overlaps that window;
+coverage is the fraction of window days with observed data. Because composites tile the calendar exactly,
+overlap days must sum to the window length, and this is asserted for all 1,500 child-windows.
+
+Heat is assigned at hexagon level (MODIS pixels are ~1 km). Green exposure is measured in a **300 m buffer**
+around the home, following the WHO accessibility indicator, using 10 m data. Each exposure is resolved at the
+scale its source supports rather than at a single imposed scale.
+
+# Results
+
+## Effect of gap-filling on child exposures
+
+```{r relink}
+show(data.frame(
+  Window = c("7 days", "30 days", "365 days"),
+  `Children with no prior value` = c(50, 3, 0),
+  `Mean change (°C)` = c(-0.01, -0.08, -1.43),
+  `Mean absolute change (°C)` = c(0.40, 0.65, 1.45),
+  `Largest change (°C)` = c(21.8, 5.48, 4.94),
+  check.names = FALSE),
+  "Exposure before and after gap-filling", 2)
+```
+
+```{r f8}
+fig("F8_naive_vs_filled.png", "30-day exposure, gaps ignored versus gaps filled")
+```
+
+```{r f9}
+fig("F9_hex_timeseries.png", "Observed and filled weeks, 2022, hexagon with most children")
+```
+
+The 365-day row is the substantive finding. The mean change (−1.43 °C) is almost identical in magnitude to
+the mean absolute change (1.45 °C), meaning nearly every child moved in the same direction. Discarding
+incomplete weeks removes winter disproportionately, leaving an annual mean weighted toward summer. Because
+gaps are denser in the built-up core, the bias is spatially structured and would inflate an estimated urban
+heat island.
+
+For short windows the changes largely cancel (mean −0.01 °C over a mean absolute 0.40 °C) but include
+individual corrections up to 21.8 °C, where a cloud-contaminated value had dominated a 7-day mean.
+
+## External validation against a ground station
+
+DWD station 01443 (Freiburg, 48.0232 °N, 7.8343 °E, 236 m) falls in hexagon 107. Daily records for 2021–2023
+are complete (1,095 days, no missing maxima).
+
+```{r station}
+show(data.frame(
+  Metric = c("Raw correlation, LST vs air Tmax",
+             "Deseasonalised correlation (monthly anomalies)",
+             "Mean LST − Tmax, cold season (48 weeks)",
+             "Mean LST − Tmax, warm season (62 weeks)",
+             "Residual RMSE, observed weeks (n = 110)",
+             "Residual RMSE, filled weeks (n = 25)",
+             "Residual mean, filled weeks"),
+  Value = c("0.96", "0.82", "−1.9 °C", "+2.9 °C", "2.75 °C", "6.10 °C", "+0.16 °C")
+), "Satellite versus ground station, hexagon 107", 2)
+```
+
+```{r f10}
+fig("F10_station_scatter.png", "Satellite LST against station air temperature")
+```
+
+```{r f11}
+fig("F11_station_timeseries.png", "Satellite and station temperature, 2021–2023")
+```
+
+Raw correlation is high (0.96) but largely reflects the annual cycle and is therefore weak evidence. After
+removing month means, agreement remains strong at **r = 0.82**: the satellite identifies which weeks were
+unusually warm or cold, not merely which season it was.
+
+The seasonal offsets are physically expected rather than error. In winter the 10:30 surface is **1.9 °C
+colder** than the afternoon air maximum, because clear nights cool the ground radiatively and the morning
+surface has not recovered; in summer solar heating puts surfaces **2.9 °C above** air temperature. This also
+identifies a limitation: MODIS daytime LST is a clear-sky sample, so withheld-clear-week validation is
+optimistic relative to true gaps, which occur on cloudy days.
+
+Filled weeks show no systematic bias at the station (**+0.16 °C**), agreeing with the −0.32 °C bias measured
+internally, but their scatter is more than twice that of observed weeks (6.10 against 2.75 °C). Inspection
+attributes the residual error to entirely missing composites coinciding with unusual weather — late October
+2022 reached 23.3 °C and mid-December 2022 was below freezing at the station, neither recoverable from
+neighbouring weeks.
+
+## Terrain as a confounder
+
+```{r t3}
+show(tab("T3_elevation_confounding.csv"), "Summer LST regressed on green share, with and without elevation")
+```
+
+```{r f12}
+fig("F12_elevation_hex.png", "Elevation per hexagon, with cohort homes")
+```
+
+Green share and elevation correlate at r = 0.55 across hexagons: the Black Forest is both green and high.
+Adjusting for elevation reduces the apparent cooling per 10 percentage points of green from **−0.74 °C to
+−0.40 °C, a 45% reduction**, while R² rises from 0.52 to 0.77.
+
+The fitted elevation coefficient, **−0.71 °C per 100 m**, is close to the environmental lapse rate of
+approximately 0.65 °C per 100 m. That the model recovers a known physical quantity it was not given is
+reassuring about the specification.
+
+One qualification deserves emphasis. Cohort homes span only 199–375 m, because built-up land is confined to
+the valley floor; the 45% attenuation is therefore identified largely from unpopulated forest hexagons where
+no child lives. Within the cohort, terrain contributes roughly 1.2 °C of variation. The practical conclusion
+is unchanged — any green–heat analysis in this city must condition on terrain — but the limited overlap
+between the exposure contrast and the study population is itself a design finding.
+
+## What an exposure window measures
+
+```{r t4}
+show(tab("T4_when_vs_where.csv"), "Variance in LST exposure explained by time versus place", 2)
+```
+
+```{r f13}
+fig("F13_windows_when_where.png", "The same children under three exposure windows")
+```
+
+For a 7-day window, examination month explains 92% of variance in exposure and hexagon explains 1%. For a
+365-day window this reverses: 63% is explained by hexagon. The 7- and 365-day exposures correlate at only
+0.08, so for an individual child they are close to independent quantities.
+
+This has direct design consequences. A short window answers questions about acute heat before assessment; a
+long window answers questions about the residential environment. Comparing children on an unadjusted 7-day
+exposure is largely comparing their appointment dates. Residual time dependence at 365 days (R² = 0.36)
+reflects genuine interannual variation, visible as the upward drift through 2022.
+
+## Equity gradient
+
+```{r t6}
+show(tab("T6_equity.csv"), "Environmental exposure per 1 SD higher socioeconomic position", 4)
+```
+
+```{r f14}
+fig("F14_equity.png", "Exposure by socioeconomic tertile")
+```
+
+Standard errors are clustered by hexagon. Built-up share is a hexagon-level variable and the 500 children
+occupy 80 hexagons, so the number of independent spatial observations is far below the number of children.
+Models are deliberately unadjusted for built-up share and elevation: these are the pathways through which
+the inequality arises, and conditioning on them would remove the quantity of interest.
+
+Per standard deviation of higher socioeconomic position, children experience **0.22 °C lower annual surface
+temperature**, **3.6 percentage points more green** within 300 m and **0.026 higher NDVI**. By tertile, the
+lowest group lives 0.4 °C warmer with 36% green nearby against 43% for the highest.
+
+The informative null is park access. 88% of children have a public green space of at least 0.5 ha within
+300 m, and this varies little by socioeconomic position (85–91%, p = 0.20). In this city inequality is not
+about the presence of a nearby green space but about how much greenery surrounds the home. An
+access-only indicator would have reported no inequality where a quantity-based indicator finds a clear
+gradient.
+
+## Recovery of a known parameter
+
+Socioeconomic position was simulated with a specified dependence on built-up share, giving a true
+standardised slope of −0.447. The analysis was then asked to recover it.
+
+```{r t5}
+show(tab("T5_truth_recovery.csv"), "Single-cohort recovery of the simulated parameter", 3)
+show(tab("T5b_coverage.csv"), "Replication over 500 simulated datasets", 3)
+```
+
+```{r f15}
+fig("F15_coverage.png", "Sampling distribution of the estimated slope across 500 replications")
+```
+
+In the primary cohort the estimate was −0.363 with a clustered 95% interval of −0.436 to −0.290, which
+**excludes** the true value. Rather than reseed the simulation, the estimator was evaluated across 500
+replications. The mean estimate was **−0.447**, identical to the planted value, and interval coverage was
+98.6% (naive) and 97.6% (clustered) against a nominal 95%.
+
+The estimator is therefore unbiased with slightly conservative intervals, and the primary cohort fell in the
+0.6% tail of the sampling distribution. Clustering had little effect here because the simulated individual
+noise was independent within hexagons; with genuine neighbourhood-level correlation the correction would be
+substantial, and it is retained for that reason.
+
+# Database and maintenance
+
+## Structure
+
+```{r db-structure}
+qry("SELECT table_name AS \"Table\", estimated_size AS \"Rows\"
+     FROM duckdb_tables() ORDER BY table_name") |>
+  show("Tables in db/freiburg_exposure.duckdb", 0)
+```
+
+Seven tables under composite primary keys. `lst_weekly` is keyed on (hex_id, date), making a duplicate
+hexagon-week a constraint violation rather than a silent double count, and `lst_filled` is declared NOT NULL
+so a gap cannot be stored. Both constraints were verified by attempting the violation.
+
+Every temperature row carries its `source` (observed, filled or removed outlier), the `method_version` that
+produced it and a `run_id` resolving to an entry in `run_log`. Any value in the database can be traced to the
+run that created it, and an analyst can restrict to observed values alone.
+
+```{r provenance}
+qry("SELECT year(date) AS Year, source AS Source, COUNT(*) AS n
+     FROM lst_weekly GROUP BY ALL ORDER BY ALL") |>
+  show("Provenance of every stored temperature value", 0)
+```
+
+## Incremental update
+
+```{r runlog}
+qry("SELECT run_id, run_type, period_start, period_end, n_lst_rows, description
+     FROM run_log ORDER BY run_id") |>
+  show("Pipeline run log", 0)
+```
+
+The 2024 composites were used to exercise the update path. New files land in a staging directory and pass a
+quality gate before ingestion: identical raster geometry (650 cells), dates on the 8-day calendar for their
+own year, and no date already present. Only then are hexagon means computed, the same 50% rule applied, and
+the **same outlier threshold reused** rather than re-estimated from the new data.
+
+All inserts occur in a single transaction. The procedure is idempotent: re-running it reports that nothing is
+new rather than duplicating rows.
+
+```{r update-summary}
+show(data.frame(
+  Check = c("New composites ingested", "Status of new weeks",
+            "New rows by provenance", "Outlier threshold",
+            "Outliers flagged in 2024", "Rows from run 1 modified",
+            "Children requiring recomputation", "Integrity tests after update"),
+  Result = c("46 weeks, 9,384 hexagon-weeks",
+             "40 usable, 5 mostly cloud, 1 missing composite (26 Dec 2024)",
+             "7,719 observed, 1,478 filled, 187 removed",
+             "0.95 °C, frozen from existing data",
+             "187 (2.0%, against 1.4% for 2021–2023)",
+             "None (verified by count and checksum)",
+             "0 — all examinations fall in 2022–2023",
+             "19 of 19 passed")
+), "Incremental update, run 2", 0)
+```
+
+2024 was flagged at a higher rate (2.0%) than the baseline period (1.4%) under an unchanged threshold,
+indicating more partly cloudy weeks with unmasked cloud edges rather than any change in rule. This is the
+kind of drift a monitoring system should surface rather than absorb.
+
+## Automated integrity tests
+
+Nineteen assertions run against the database before and after any update: one row per hexagon-week; the grid
+complete against the composite inventory; no null filled values; only permitted source labels; observed
+values bit-identical to their raw inputs; every removed outlier present in the outlier log; every row
+resolving to a logged run; temperatures within −40 to 70 °C; land-cover shares within [0, 1]; 500 unique
+children each in a known hexagon; exactly three windows per child; and each year's composite calendar
+starting 1 January in steps of 8 days.
+
+The land-cover assertion failed on first execution, identifying 43 hexagons whose `inside_frac` exceeded 1 by
+floating-point rounding. The values were clamped in a logged transaction and the source file corrected so a
+rebuild does not reintroduce the defect.
+
+# Limitations
+
+```{r limitations}
+show(data.frame(
+  Limitation = c("Cohort is simulated",
+                 "Clear-sky sampling bias",
+                 "Fully missing composites",
+                 "Homes sampled uniformly on built-up land",
+                 "Spatial autocorrelation not modelled",
+                 "Single-city, single-sensor",
+                 "External API stability"),
+  Consequence = c("The socioeconomic gradient is partly by construction; the exposure data and the pipeline are real",
+                  "Validation withheld clear weeks, so reported errors understate error in genuine cloud gaps",
+                  "All methods converge near 3.7–4.0 °C; unusual weather in missing weeks is unrecoverable",
+                  "Built-up cells include industrial and transport land, so a few homes fall in non-residential areas",
+                  "Clustered standard errors address within-hexagon dependence but not continuous spatial correlation",
+                  "Thresholds tuned on Freiburg; transfer to flatter or larger cities requires re-validation",
+                  "A Planetary Computer change to strict RFC3339 datetimes broke ingestion mid-project"),
+  `Planned remedy` = c("Apply to real cohort data under a data-use agreement",
+                       "Introduce ERA5-Land reanalysis as a cloud-independent predictor",
+                       "Hybrid filling: anomaly where partial coverage exists, reanalysis-informed otherwise",
+                       "Weight sampling by the Zensus 2022 100 m population grid",
+                       "Fit spatial error or CAR models as sensitivity analysis",
+                       "Replicate in a second city with contrasting terrain",
+                       "Pin API contracts and assert response schema in the ingestion tests"),
+  check.names = FALSE
+), "Known limitations and intended remedies", 0)
+```
+
+# Reproducibility
+
+Package versions are pinned with `renv`. Numbered scripts run in sequence from study-area definition through
+to the database update; downloads are cached so re-runs do not re-fetch. Random seeds are fixed, including
+the primary cohort seed, which was set before any result was examined and not subsequently changed.
+
+```{r sessioninfo}
+data.frame(
+  Component = c("R version", "Database", "Database size", "Pipeline runs logged",
+                "Integrity tests", "Period covered", "Figures", "Result tables"),
+  Value = c(paste(R.version$major, R.version$minor, sep = "."),
+            "DuckDB, 7 tables",
+            paste0(round(file.size("db/freiburg_exposure.duckdb") / 1e6, 1), " MB"),
+            as.character(qry("SELECT COUNT(*) AS n FROM run_log")$n),
+            "19, all passing",
+                        with(qry("SELECT MIN(date) AS a, MAX(date) AS b FROM lst_composite"),
+                 paste(format(as.Date(a), "%d %b %Y"), "to", format(as.Date(b), "%d %b %Y"))),
+
+            as.character(length(list.files("outputs/figures", pattern = "png$"))),
+            as.character(length(list.files("outputs/tables", pattern = "csv$"))))
+) |> show("Reproducibility summary", 0)
+```
+
+```{r close, include=FALSE}
+dbDisconnect(con)
+```
