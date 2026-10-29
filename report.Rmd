@@ -49,6 +49,7 @@ database with full provenance on every value, 19 automated integrity tests, and 
 update procedure.
 
 The cohort is simulated; **all environmental data are real**.
+Code, tests and pinned package versions: [github.com/damanijay/Freiburg-exposure-linkage](https://github.com/damanijay/Freiburg-exposure-linkage). Pipeline scripts are in `R/`, numbered in run order; integrity tests are in `tests/`.
 
 ```{r headline}
 h <- qry("SELECT COUNT(*) AS hexagon_weeks FROM lst_weekly")
@@ -184,11 +185,11 @@ random withheld pixels — because the citywide anomaly carries that week's actu
 composite is missing, no anomaly can be borrowed and all three methods converge near 3.7–4.0 °C. That is the
 honest ceiling of temporal interpolation without an external meteorological source.
 
-## Outlier screening (protocol v1.1)
+## Outlier screening
 
 External station comparison revealed values that internal cross-validation could not detect, including an
 LST of −10.0 °C in the station hexagon on 1 November 2023 against an air maximum of 13.8 °C — a cloud top
-recorded as ground. The protocol was therefore amended before the database was built.
+recorded as ground. Version 1.0 had no outlier screen and used a mean rather than a median anomaly; all stored values carry the version that produced them.
 
 Each value was expressed as a deviation from its own hexagon's seasonal climatology, then compared with the
 citywide median deviation for that week. Values exceeding **4 robust standard deviations** (MAD-based,

@@ -1831,7 +1831,9 @@ is a single DuckDB database with full provenance on every value, 19
 automated integrity tests, and a demonstrated incremental update
 procedure.</p>
 <p>The cohort is simulated; <strong>all environmental data are
-real</strong>.</p>
+real</strong>. Code, tests and pinned package versions: <a href="https://github.com/damanijay/Freiburg-exposure-linkage">github.com/damanijay/Freiburg-exposure-linkage</a>.
+Pipeline scripts are in <code>R/</code>, numbered in run order;
+integrity tests are in <code>tests/</code>.</p>
 <table class="table table-striped table-condensed" style="width: auto !important; margin-left: auto; margin-right: auto;">
 <caption>
 Headline results
@@ -2433,14 +2435,15 @@ anomaly can be borrowed and all three methods converge near 3.7–4.0 °C.
 That is the honest ceiling of temporal interpolation without an external
 meteorological source.</p>
 </div>
-<div id="outlier-screening-protocol-v1.1" class="section level2" number="3.4">
-<h2><span class="header-section-number">3.4</span> Outlier screening
-(protocol v1.1)</h2>
+<div id="outlier-screening" class="section level2" number="3.4">
+<h2><span class="header-section-number">3.4</span> Outlier
+screening</h2>
 <p>External station comparison revealed values that internal
 cross-validation could not detect, including an LST of −10.0 °C in the
 station hexagon on 1 November 2023 against an air maximum of 13.8 °C — a
-cloud top recorded as ground. The protocol was therefore amended before
-the database was built.</p>
+cloud top recorded as ground. Version 1.0 had no outlier screen and used
+a mean rather than a median anomaly; all stored values carry the version
+that produced them.</p>
 <p>Each value was expressed as a deviation from its own hexagon’s
 seasonal climatology, then compared with the citywide median deviation
 for that week. Values exceeding <strong>4 robust standard
