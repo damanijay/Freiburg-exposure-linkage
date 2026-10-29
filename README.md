@@ -1,5 +1,7 @@
 # Satellite exposure linkage for a child cohort — Freiburg, 2021–2024
 
+**📄 [Read the full report](https://damanijay.github.io/Freiburg-exposure-linkage/report.html)**
+
 A reproducible pipeline that turns raw satellite products into individual-level
 environmental exposures, with validated gap-filling, provenance tracking and an
 incremental update procedure.
